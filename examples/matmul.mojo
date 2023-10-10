@@ -110,7 +110,7 @@ fn run_matmul_python(M: Int, N: Int, K: Int) -> Float64:
         else:
             print("pymatmul module not found")
     except e:
-        print(e.value)
+        print(e)
         pass
     return gflops
 
@@ -169,7 +169,7 @@ fn matmul_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
 
             vectorize[nelts, dot](C.cols)
 
-    parallelize[calc_row](rt, C.rows)
+    parallelize[calc_row](C.rows)
 
 
 # Perform 2D tiling on the iteration space defined by end_x and end_y.
@@ -205,7 +205,7 @@ fn matmul_tiled_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
         alias tile_size = 4
         tile[calc_tile, nelts * tile_size, tile_size](C.cols, B.rows)
 
-    parallelize[calc_row](rt, C.rows)
+    parallelize[calc_row](C.rows)
 
 
 # Unroll the vectorized loop by a constant factor.
@@ -237,7 +237,7 @@ fn matmul_tiled_unrolled_parallelized(
         alias tile_size = 4
         tile[calc_tile, nelts * tile_size, tile_size](C.cols, B.rows)
 
-    parallelize[calc_row](rt, C.rows)
+    parallelize[calc_row](C.rows)
     
 # Perform 2D tiling on the iteration space defined by end_x and end_y, parallelizing over y.
 fn tile_parallel[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end_y: Int):
@@ -252,7 +252,7 @@ fn tile_parallel[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end
 
 # Tile the output into tiles we can accumulate in registers. This strategy means we can
 # compute tile_i * tile_j values of output for only reading tile_i + tile_j input values.
-fn matmul_tiled_output(
+fn tile_parallel_accumulate_registers(
     C: Matrix, A: Matrix, B: Matrix, rt: Runtime
 ):
     @parameter
@@ -379,12 +379,13 @@ fn main():
             " parallelized} matrix multiplication in Mojo: "
         ),
     )
-    benchmark[matmul_tiled_output](
+    benchmark[tile_parallel_accumulate_registers](
         M,
         N,
         K,
         python_gflops,
         (
-            "Throughput of a 512x512 {tiled output} matrix multiplication in Mojo: "
+            "Throughput of a 512x512 {register accumulated + tiled + unrolled"
+            "vectorized + parallelized} matrix multiplication in Mojo: "
         ),
     )
