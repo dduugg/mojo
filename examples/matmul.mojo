@@ -27,7 +27,7 @@ from algorithm import vectorize, parallelize, vectorize_unroll
 from algorithm import Static2DTileUnitFunc as Tile2DFunc
 from python.object import PythonObject
 from python.python import Python, _destroy_python, _init_python
-from runtime.llcl import Runtime
+
 
 
 struct Matrix:
@@ -62,6 +62,14 @@ struct Matrix:
     @always_inline
     fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[DType.float32, nelts]):
         return self.data.simd_store[nelts](y * self.cols + x, val)
+
+alias M = 512
+alias N = 512
+alias K = 4096
+alias test_match = True
+let A = Matrix(M, K)
+let B = Matrix(K, N)
+var prior_sum: Float64 = 0.0
         
 struct MatrixView:
     var data: DTypePointer[DType.float32]
@@ -115,18 +123,21 @@ fn run_matmul_python(M: Int, N: Int, K: Int) -> Float64:
     return gflops
 
 
-fn matmul_naive(C: Matrix, A: Matrix, B: Matrix, _rt: Runtime):
+fn matmul_naive(C: Matrix):
     for m in range(C.rows):
         for k in range(A.cols):
             for n in range(C.cols):
                 C[m, n] += A[m, k] * B[k, n]
 
 
+
+
+
 # Mojo has SIMD vector types, we can vectorize the Matmul code as follows.
 alias nelts = simdwidthof[DType.float32]()  # The SIMD vector width.
 
 
-fn matmul_vectorized_0(C: Matrix, A: Matrix, B: Matrix, _rt: Runtime):
+fn matmul_vectorized_0(C: Matrix):
     for m in range(C.rows):
         for k in range(A.cols):
             for nv in range(0, C.cols, nelts):
@@ -141,7 +152,7 @@ fn matmul_vectorized_0(C: Matrix, A: Matrix, B: Matrix, _rt: Runtime):
 
 # Simplify the code by using the builtin vectorize function
 # from Functional import vectorize
-fn matmul_vectorized_1(C: Matrix, A: Matrix, B: Matrix, _rt: Runtime):
+fn matmul_vectorized_1(C: Matrix):
     for m in range(C.rows):
         for k in range(A.cols):
 
@@ -156,7 +167,7 @@ fn matmul_vectorized_1(C: Matrix, A: Matrix, B: Matrix, _rt: Runtime):
 
 # Parallelize the code by using the builtin parallelize function
 # from Functional import parallelize
-fn matmul_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
+fn matmul_parallelized(C: Matrix):
     @parameter
     fn calc_row(m: Int):
         for k in range(A.cols):
@@ -169,7 +180,7 @@ fn matmul_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
 
             vectorize[nelts, dot](C.cols)
 
-    parallelize[calc_row](C.rows)
+    parallelize[calc_row](6)
 
 
 # Perform 2D tiling on the iteration space defined by end_x and end_y.
@@ -181,7 +192,7 @@ fn tile[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end_y: Int):
 
 
 # Use the above tile function to perform tiled matmul.
-fn matmul_tiled_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
+fn matmul_tiled_parallelized(C: Matrix):
     @parameter
     fn calc_row(m: Int):
         @parameter
@@ -205,14 +216,12 @@ fn matmul_tiled_parallelized(C: Matrix, A: Matrix, B: Matrix, rt: Runtime):
         alias tile_size = 4
         tile[calc_tile, nelts * tile_size, tile_size](C.cols, B.rows)
 
-    parallelize[calc_row](C.rows)
+    parallelize[calc_row](C.rows, C.rows)
 
 
 # Unroll the vectorized loop by a constant factor.
 # from Functional import vectorize_unroll
-fn matmul_tiled_unrolled_parallelized(
-    C: Matrix, A: Matrix, B: Matrix, rt: Runtime
-):
+fn matmul_tiled_unrolled_parallelized(C: Matrix):
     @parameter
     fn calc_row(m: Int):
         @parameter
@@ -237,7 +246,7 @@ fn matmul_tiled_unrolled_parallelized(
         alias tile_size = 4
         tile[calc_tile, nelts * tile_size, tile_size](C.cols, B.rows)
 
-    parallelize[calc_row](C.rows)
+    parallelize[calc_row](C.rows, C.rows)
     
 # Perform 2D tiling on the iteration space defined by end_x and end_y, parallelizing over y.
 fn tile_parallel[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end_y: Int):
@@ -252,9 +261,7 @@ fn tile_parallel[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end
 
 # Tile the output into tiles we can accumulate in registers. This strategy means we can
 # compute tile_i * tile_j values of output for only reading tile_i + tile_j input values.
-fn tile_parallel_accumulate_registers(
-    C: Matrix, A: Matrix, B: Matrix, rt: Runtime
-):
+fn tile_parallel_accumulate_registers(C: Matrix):
     @parameter
     fn calc_tile[tile_j: Int, tile_i: Int](jo: Int, io: Int):
         # Allocate the tile of accumulators on the stack.
@@ -287,28 +294,40 @@ fn tile_parallel_accumulate_registers(
 
 @always_inline
 fn benchmark[
-    func: fn (Matrix, Matrix, Matrix, Runtime) -> None
+    func: fn (Matrix) -> None
 ](M: Int, N: Int, K: Int, base_gflops: Float64, str: String):
     var C = Matrix(M, N)
     C.zero()
-    var A = Matrix(M, K)
-    var B = Matrix(K, N)
-
-    with Runtime() as rt:
-
-        @always_inline
+    var tripped = False
+    @always_inline
+    @parameter
+    fn test_fn():
         @parameter
-        fn test_fn():
-            _ = func(C, A, B, rt)
+        if test_match:
+            C.zero()
+            _ = func(C)
+            var sum = Float64(0.0)
+            for m in range(C.rows):
+                for k in range(C.cols):
+                    sum += C.load[1](m, k).cast[DType.float64]()
+            if prior_sum < 1.0:
+                prior_sum = sum
+            else:
+                if prior_sum != sum and not tripped:
+                    print("Warning: the sum of all elements doesn't match prior benchmark")
+                    print("Check the implementation of below benchmark:")
+                    tripped = True
+        else:
+            _ = func(C)
 
-        let secs = Float64(Benchmark().run[test_fn]()) / 1_000_000_000
-        # Prevent the matrices from being freed before the benchmark run
-        _ = (A, B, C)
-        let gflops = ((2 * M * N * K) / secs) / 1e9
-        let speedup: Float64 = gflops / base_gflops
-        # print(gflops, "GFLOP/s", speedup, " speedup")
-        print(str)
-        print(gflops, "GFLOP/s <>", speedup.to_int(), "x speedup over Python")
+    let secs = Float64(Benchmark().run[test_fn]()) / 1_000_000_000
+    # Prevent the matrices from being freed before the benchmark run
+    _ = (A, B, C)
+    let gflops = ((2 * M * N * K) / secs) / 1e9
+    let speedup: Float64 = gflops / base_gflops
+    # print(gflops, "GFLOP/s", speedup, " speedup")
+    print(str)
+    print(gflops, "GFLOP/s <>", speedup.to_int(), "x speedup over Python")
 
 
 fn main():
